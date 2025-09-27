@@ -23,7 +23,7 @@ DB_CONFIG = {
 # =========================
 # Table Names
 # =========================
-TABLE_STAGING = "staging_table"
+TABLE_STAGING = "vendor_staging_table"
 TABLE_VENDORS = "vendors"
 TABLE_ADVISORIES = "advisories"
 TABLE_CVES = "cves"
@@ -166,7 +166,7 @@ def get_vendor_id(conn, vendor_name="SAP") -> int:
 # Insert Functions
 # =========================
 def insert_advisory(conn, advisory: dict):
-    if not advisory.get("note_id"):
+    if not advisory.get("advisory_id"):
         return
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -175,7 +175,7 @@ def insert_advisory(conn, advisory: dict):
             ) VALUES (%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (advisory_id) DO NOTHING
         """, (
-            advisory["note_id"],
+            advisory["advisory_id"],
             advisory.get("vendor_id"),
             advisory.get("title"),
             advisory.get("severity"),
@@ -239,38 +239,46 @@ def process_staging_row(conn, staging_id, raw_json):
     vendor_id = get_vendor_id(conn, "SAP")
     cleaned_title = clean_title(data.get("title"))
 
-    # Insert Advisory
-    advisory = {
-        "note_id": data.get("note_id"),
-        "vendor_id": vendor_id,
-        "title": cleaned_title,
-        "severity": data.get("priority"),
-        "initial_release_date": data.get("release_date"),
-        "advisory_url": data.get("advisory_url")
-    }
-    insert_advisory(conn, advisory)
-
-    # Insert CVEs
+    # Determine advisory IDs
     cve_ids = [data.get("cve_id")] + data.get("related_cves", [])
-    for cve_id in filter(None, cve_ids):
-        cve_data = {
-            "cve_id": cve_id,
-            "cwe_id": None,
-            "description": cleaned_title,
-            "cvss_score": data.get("cvss_score"),
-            "cvss_vector": data.get("cvss_vector"),
-            "initial_release_date": data.get("release_date"),
-            "reference_url": data.get("advisory_url")
-        }
-        insert_cve(conn, cve_data)
-        insert_advisory_cve_map(conn, data.get("note_id"), cve_id)
+    advisory_ids = []
 
-    # Insert Product CPEs
-    product_pairs = extract_product_versions(data.get("title"))
-    for pair in product_pairs:
-        cpes = generate_cpe_entries(pair)
-        for cpe in cpes:
-            insert_product_cpe(conn, data.get("note_id"), cpe)
+    if any(filter(None, cve_ids)):
+        for cve_id in filter(None, cve_ids):
+            advisory_ids.append(f"{data.get('note_id')}-{cve_id}")
+    else:
+        advisory_ids.append(data.get("note_id"))
+
+    # Insert advisory, CVE, mapping, and products
+    for advisory_id in advisory_ids:
+        insert_advisory(conn, {
+            "advisory_id": advisory_id,
+            "vendor_id": vendor_id,
+            "title": cleaned_title,
+            "severity": data.get("priority"),
+            "initial_release_date": data.get("release_date"),
+            "advisory_url": data.get("advisory_url")
+        })
+
+        # Insert CVEs
+        for cve_id in filter(None, cve_ids):
+            insert_cve(conn, {
+                "cve_id": cve_id,
+                "cwe_id": None,
+                "description": cleaned_title,
+                "cvss_score": data.get("cvss_score"),
+                "cvss_vector": data.get("cvss_vector"),
+                "initial_release_date": data.get("release_date"),
+                "reference_url": data.get("advisory_url")
+            })
+            insert_advisory_cve_map(conn, advisory_id, cve_id)
+
+        # Insert Product CPEs
+        product_pairs = extract_product_versions(data.get("title"))
+        for pair in product_pairs:
+            cpes = generate_cpe_entries(pair)
+            for cpe in cpes:
+                insert_product_cpe(conn, advisory_id, cpe)
 
     # Mark staging row as processed
     with conn.cursor() as cur:
