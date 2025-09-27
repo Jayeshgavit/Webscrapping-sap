@@ -5,22 +5,40 @@ import os
 import re
 import argparse
 import json
-import psycopg2
-import pandas as pd
+import subprocess
+import sys
 from datetime import datetime
+
+# =========================
+# Auto-install dependencies if missing
+# =========================
+def install_and_import(package, import_name=None):
+    import importlib
+    try:
+        return importlib.import_module(import_name or package)
+    except ImportError:
+        print(f"📦 Installing missing package: {package}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+        return importlib.import_module(import_name or package)
+
+# Import required libraries with auto-install
+psycopg2 = install_and_import("psycopg2-binary", "psycopg2")
+pd = install_and_import("pandas", "pandas")
+dotenv = install_and_import("python-dotenv", "dotenv")
 from psycopg2.extras import Json
+from dotenv import load_dotenv
 
 # =========================
-# Database configuration
+# Load DB config from .env
 # =========================
+load_dotenv()
 DB_CONFIG = {
-    "host": "localhost",
-    "dbname": "sap",
-    "user": "postgres",
-    "password": "623809",
-    "port": 5432,
+    "host": os.getenv("DB_HOST", "localhost"),
+    "dbname": os.getenv("DB_NAME", "sap"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASS", "623809"),
+    "port": int(os.getenv("DB_PORT", 5432)),
 }
-
 TABLE_NAME = "staging_table"
 
 # =========================
@@ -62,7 +80,7 @@ def connect_to_db():
 def ensure_table():
     conn = None
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        conn = connect_to_db()
         cur = conn.cursor()
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {TABLE_NAME} (

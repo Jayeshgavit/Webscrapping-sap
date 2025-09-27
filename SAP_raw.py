@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-SAP Security Notes Scraper
-- Scrapes recent + archive advisories
-- Stores into PostgreSQL staging table with schema changes
+SAP Security Notes Collector
+- Scrapes recent + archive advisories (web)
+- Imports PDF-based advisories from CSV/Excel
+- Stores into PostgreSQL staging table
 """
 
 import os
@@ -19,11 +20,14 @@ import psycopg2
 import json
 import logging
 from dotenv import load_dotenv
+import pandas as pd
+from psycopg2.extras import Json
+import argparse
 
 # =========================
 # Dependencies Auto-install
 # =========================
-required_modules = ["requests", "bs4", "psycopg2", "python-dotenv"]
+required_modules = ["requests", "bs4", "psycopg2", "python-dotenv", "pandas", "openpyxl"]
 for module in required_modules:
     try:
         __import__(module)
@@ -33,11 +37,8 @@ for module in required_modules:
 # -------------------------
 # Logging
 # -------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s"
-)
-logger = logging.getLogger("sap_scraper")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
+logger = logging.getLogger("sap_collector")
 
 # -------------------------
 # Load Env + DB Config
@@ -106,25 +107,12 @@ def insert_raw(data_dict):
         conn = psycopg2.connect(**DB_CONFIG)
         cur = conn.cursor()
 
-        ordered = {
-            "note_id": data_dict.get("note_id"),
-            "cve_id": data_dict.get("cve_id"),
-            "release_date": data_dict.get("release_date"),
-            "title": clean_text(data_dict.get("title", "")),
-            "priority": data_dict.get("priority"),
-            "cvss_score": data_dict.get("cvss_score"),
-            "cvss_vector": data_dict.get("cvss_vector"),
-            "source_type": data_dict.get("source_type"),
-            "related_cves": data_dict.get("related_cves"),
-            "month": data_dict.get("month"),
-        }
-
         cur.execute(
             f"""INSERT INTO {TABLE_NAME} 
                 (vendor_name, source_url, raw_data) 
                 VALUES (%s, %s, %s)
                 ON CONFLICT (source_url) DO NOTHING;""",
-            ("SAP", data_dict.get("month_url"), json.dumps(ordered, ensure_ascii=False))
+            ("SAP", data_dict.get("source_url"), json.dumps(data_dict, ensure_ascii=False))
         )
 
         conn.commit()
@@ -148,7 +136,6 @@ def scrape_recent():
     logger.info(f"🔍 Found {len(month_links)} month links (recent)")
 
     for link in month_links:
-        logger.info(f"📅 Processing month: {link}")
         soup_month = BeautifulSoup(requests.get(link).text, "html.parser")
 
         release_date = None
@@ -196,7 +183,7 @@ def scrape_recent():
                 "source_type": "recent",
                 "related_cves": related_cves,
                 "month": month_str,
-                "month_url": f"{link}#{note_id}"
+                "source_url": f"{link}#{note_id}"
             }
             insert_raw(data)
     logger.info("✅ Recent advisories stored")
@@ -222,7 +209,6 @@ def scrape_archive():
     logger.info(f"🔍 Found {len(html_links)} archive bulletin links")
 
     for link in html_links:
-        logger.info(f"📖 Scraping archive: {link}")
         soup_page = BeautifulSoup(requests.get(link).text, "html.parser")
 
         for h2 in soup_page.find_all("h2"):
@@ -270,16 +256,72 @@ def scrape_archive():
                     "source_type": "archive",
                     "related_cves": related_cves,
                     "month": month,
-                    "month_url": f"{link}#{note_id}"
+                    "source_url": f"{link}#{note_id}"
                 }
                 insert_raw(data)
     logger.info("✅ Archive advisories stored")
 
 # -------------------------
+# Import from CSV/Excel (PDF sources)
+# -------------------------
+def normalize_json(record):
+    normalized = {
+        "note_id": str(record.get("note_id") or "").strip() or None,
+        "cve_id": str(record.get("cve_id") or "").strip() or None,
+        "release_date": None,
+        "title": re.sub(r"\s+", " ", str(record.get("title") or "").strip()) or None,
+        "priority": str(record.get("priority") or "").strip() or None,
+        "cvss_score": str(record.get("cvss_score") or "").strip() or None,
+        "cvss_vector": str(record.get("cvss_vector") or "").strip() or None,
+        "source_type": "pdf",
+        "related_cves": record.get("related_cves") if isinstance(record.get("related_cves"), list) else [],
+        "month": None,
+    }
+
+    rd = record.get("release_date")
+    if rd:
+        try:
+            rd_parsed = pd.to_datetime(str(rd)).date()
+            normalized["release_date"] = rd_parsed.isoformat()
+            normalized["month"] = rd_parsed.strftime("%B-%Y").lower()
+        except:
+            pass
+
+    return normalized
+
+def process_data_file(filename, file_type):
+    df = pd.read_csv(filename) if file_type == "csv" else pd.read_excel(filename)
+    if "raw_data" not in df.columns:
+        logger.error("❌ No 'raw_data' column found in input file.")
+        return False
+
+    for _, row in df.iterrows():
+        try:
+            raw_json = row["raw_data"]
+            if isinstance(raw_json, str):
+                raw_json = json.loads(raw_json)
+            normalized = normalize_json(raw_json)
+            normalized["source_url"] = f"pdf:{normalized.get('note_id')}"
+            insert_raw(normalized)
+        except Exception as e:
+            logger.error(f"⚠️ Row import failed: {e}")
+    logger.info("✅ PDF-based advisories stored")
+    return True
+
+# -------------------------
 # Main
 # -------------------------
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="SAP Vulnerability Collector")
+    parser.add_argument("--import-file", help="Optional CSV/Excel file with PDF advisories")
+    parser.add_argument("--type", choices=["csv", "excel"], default="excel", help="File type if using --import-file")
+    args = parser.parse_args()
+
     ensure_table()
     scrape_recent()
     scrape_archive()
-    logger.info("🎉 All advisories stored successfully!")
+
+    if args.import_file:
+        process_data_file(args.import_file, args.type)
+
+    logger.info("🎉 All advisories collected successfully!")
