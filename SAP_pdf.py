@@ -742,6 +742,255 @@
 
 
 
+# #!/usr/bin/env python3
+# # -*- coding: utf-8 -*-
+
+# import os
+# import re
+# import argparse
+# import json
+# import subprocess
+# import sys
+# from datetime import datetime
+
+# # =========================
+# # Auto-install dependencies if missing
+# # =========================
+# def install_and_import(package, import_name=None):
+#     import importlib
+#     try:
+#         return importlib.import_module(import_name or package)
+#     except ImportError:
+#         print(f"📦 Installing missing package: {package}")
+#         subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+#         return importlib.import_module(import_name or package)
+
+# # Import required libraries with auto-install
+# psycopg2 = install_and_import("psycopg2-binary", "psycopg2")
+# pd = install_and_import("pandas", "pandas")
+# dotenv = install_and_import("python-dotenv", "dotenv")
+# tqdm = install_and_import("tqdm", "tqdm")
+# from psycopg2.extras import Json
+# from dotenv import load_dotenv
+# from tqdm import tqdm
+
+# # =========================
+# # Load DB config from .env
+# # =========================
+# load_dotenv()
+# DB_CONFIG = {
+#     "host": os.getenv("DB_HOST", "localhost"),
+#     "dbname": os.getenv("DB_NAME", "sap"),
+#     "user": os.getenv("DB_USER", "postgres"),
+#     "password": os.getenv("DB_PASS", "623809"),
+#     "port": int(os.getenv("DB_PORT", 5432)),
+# }
+# TABLE_NAME = "vendor_staging_table"
+
+# # =========================
+# # Archive base URL (constant inside raw_data)
+# # =========================
+# ARCHIVE_BASE_URL = "https://support.sap.com/en/my-support/knowledge-base/security-notes-news/security-patch-day-archives.html"
+
+# # =========================
+# # Connect to DB
+# # =========================
+# def connect_to_db():
+#     return psycopg2.connect(**DB_CONFIG)
+
+# # =========================
+# # Ensure staging table
+# # =========================
+# def ensure_table():
+#     conn = None
+#     try:
+#         conn = connect_to_db()
+#         cur = conn.cursor()
+#         cur.execute(f"""
+#             CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+#                 staging_id SERIAL PRIMARY KEY,
+#                 vendor_name TEXT NOT NULL,
+#                 source_url TEXT NOT NULL UNIQUE,
+#                 raw_data JSONB NOT NULL,
+#                 processed BOOLEAN DEFAULT FALSE,
+#                 processed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+#             );
+#         """)
+#         conn.commit()
+#         cur.close()
+#     finally:
+#         if conn:
+#             conn.close()
+
+# # =========================
+# # Extract Related CVEs from title
+# # =========================
+# def extract_related_cves(title, main_cve=None):
+#     """Extract all CVEs in title and return as related CVEs list"""
+#     related = []
+#     if not title:
+#         return related
+#     # Find all CVE patterns in title
+#     all_cves = re.findall(r"CVE-\d{4}-\d{4,}", title, re.IGNORECASE)
+#     # Remove the main CVE if provided
+#     if main_cve and main_cve in all_cves:
+#         all_cves.remove(main_cve)
+#     return all_cves
+
+# # =========================
+# # Normalize JSON
+# # =========================
+# def normalize_json(record):
+#     normalized = {}
+
+#     normalized["note_id"] = str(record.get("note_id")).strip() if record.get("note_id") else None
+
+#     # ---------------- Main CVE + Related CVEs Logic ----------------
+#     title = str(record.get("title") or "").strip()
+#     provided_related_cves = record.get("related_cves", [])
+
+#     # If related_cves field exists, take first as main CVE, rest as related
+#     if isinstance(provided_related_cves, list) and provided_related_cves:
+#         normalized["cve_id"] = provided_related_cves[0].strip()
+#         normalized["related_cves"] = [c.strip() for c in provided_related_cves[1:]]
+#     else:
+#         # fallback: parse from title
+#         all_cves = re.findall(r"CVE-\d{4}-\d{4,}", title, re.IGNORECASE)
+#         normalized["cve_id"] = all_cves[0] if all_cves else None
+#         normalized["related_cves"] = all_cves[1:] if len(all_cves) > 1 else []
+
+#     # ---------------- Rest of normalization ----------------
+#     rd = record.get("release_date")
+#     if rd:
+#         try:
+#             rd_parsed = pd.to_datetime(str(rd)).date()
+#             normalized["release_date"] = rd_parsed.isoformat()
+#             normalized["month"] = rd_parsed.strftime("%B-%Y").lower()
+#         except Exception:
+#             normalized["release_date"] = None
+#             normalized["month"] = None
+#     else:
+#         normalized["release_date"] = None
+#         normalized["month"] = None
+
+#     normalized["title"] = re.sub(r"\s+", " ", title) if title else None
+#     normalized["priority"] = str(record.get("priority")).strip() if record.get("priority") else None
+#     normalized["advisory_url"] = ARCHIVE_BASE_URL
+#     normalized["cvss_score"] = str(record.get("cvss_score")).strip() if record.get("cvss_score") else None
+#     normalized["cvss_vector"] = str(record.get("cvss_vector")).strip() if record.get("cvss_vector") else None
+#     normalized["source_vector"] = "pdf"
+
+#     return normalized
+
+# # =========================
+# # Parse JSON string/value to JSONB
+# # =========================
+# def parse_json_for_jsonb(value):
+#     if value is None or (isinstance(value, float) and pd.isna(value)):
+#         return normalize_json({})
+#     if isinstance(value, dict):
+#         return normalize_json(value)
+#     s = str(value).strip().replace("\x00", " ").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+#     s = re.sub(r"\s+", " ", s)
+#     try:
+#         data = json.loads(s)
+#         return normalize_json(data)
+#     except Exception:
+#         return normalize_json({})
+
+# # =========================
+# # Read file
+# # =========================
+# def read_file(filename, file_type):
+#     if file_type == "csv":
+#         with open(filename, "r", encoding="utf-8") as f:
+#             sample = f.read(2048)
+#         delimiter = "," if sample.count(",") >= sample.count(";") else ";"
+#         print(f"Detected CSV delimiter: '{delimiter}'")
+#         return pd.read_csv(filename, delimiter=delimiter, encoding="utf-8")
+#     else:
+#         return pd.read_excel(filename)
+
+# # =========================
+# # Build staging source_url
+# # =========================
+# def build_staging_source_url(note_id, row_num):
+#     """Unique key for DB to avoid conflict"""
+#     if note_id:
+#         return f"{ARCHIVE_BASE_URL}#{note_id}"
+#     return f"{ARCHIVE_BASE_URL}#row{row_num}"
+
+# # =========================
+# # Process Data
+# # =========================
+# def process_data_file(filename, file_type):
+#     conn = connect_to_db()
+#     ensure_table()
+#     cur = conn.cursor()
+
+#     df = read_file(filename, file_type)
+#     if "raw_data" not in df.columns:
+#         print("❌ No 'raw_data' column found in input file.")
+#         return False
+
+#     success, errors = 0, 0
+#     print(f"\n📊 Processing {len(df)} rows...")
+
+#     for row_num, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df)), start=1):
+#         try:
+#             raw_json = parse_json_for_jsonb(row["raw_data"])
+#             note_id = raw_json.get("note_id")
+#             staging_url = build_staging_source_url(note_id, row_num)
+
+#             cur.execute(
+#                 f"""
+#                 INSERT INTO {TABLE_NAME} (vendor_name, source_url, raw_data)
+#                 VALUES (%s, %s, %s)
+#                 ON CONFLICT (source_url) DO NOTHING
+#                 """,
+#                 ("SAP", staging_url, Json(raw_json)),
+#             )
+#             success += 1
+
+#         except Exception as e:
+#             errors += 1
+#             print(f"⚠️ Row {row_num} insert error: {e}")
+
+#     conn.commit()
+#     cur.close()
+#     conn.close()
+
+#     print("\n📊 IMPORT SUMMARY")
+#     print(f"✅ Inserted: {success}")
+#     print(f"⚠️ Errors: {errors}")
+#     return True
+
+# # =========================
+# # Main
+# # =========================
+# if __name__ == "__main__":
+#     script_dir = os.path.dirname(os.path.abspath(__file__))
+#     default_file = os.path.join(script_dir, "sap_security_notes_full_title_cleaned.xlsx")
+
+#     parser = argparse.ArgumentParser(description="SAP Vulnerability Importer (clean JSONB)")
+#     parser.add_argument("filename", nargs="?", default=default_file, help="Path to CSV/Excel file")
+#     parser.add_argument("--type", choices=["csv", "excel"], default="excel", help="File type: csv or excel (default: excel)")
+#     args = parser.parse_args()
+
+#     if not os.path.exists(args.filename):
+#         print(f"❌ File not found: {args.filename}")
+#         raise SystemExit(1)
+
+#     print("SAP Vulnerability Staging Importer")
+#     print("🔧 Normalizing raw_data into clean JSONB with strict schema + archive source_url + Main/Related CVEs extraction")
+#     print("=" * 70)
+
+#     ok = process_data_file(args.filename, args.type)
+#     print("\n✅ Import completed successfully!" if ok else "\n❌ Import failed!")
+
+
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -823,16 +1072,30 @@ def ensure_table():
             conn.close()
 
 # =========================
+# Make source_url unique in DB
+# =========================
+def make_unique_source_url(conn, base_url):
+    cur = conn.cursor()
+    final_url = base_url
+    counter = 1
+    while True:
+        cur.execute(f"SELECT 1 FROM {TABLE_NAME} WHERE source_url=%s LIMIT 1", (final_url,))
+        if cur.fetchone():
+            final_url = f"{base_url}#{counter}"
+            counter += 1
+        else:
+            break
+    cur.close()
+    return final_url
+
+# =========================
 # Extract Related CVEs from title
 # =========================
 def extract_related_cves(title, main_cve=None):
-    """Extract all CVEs in title and return as related CVEs list"""
     related = []
     if not title:
         return related
-    # Find all CVE patterns in title
     all_cves = re.findall(r"CVE-\d{4}-\d{4,}", title, re.IGNORECASE)
-    # Remove the main CVE if provided
     if main_cve and main_cve in all_cves:
         all_cves.remove(main_cve)
     return all_cves
@@ -849,17 +1112,15 @@ def normalize_json(record):
     title = str(record.get("title") or "").strip()
     provided_related_cves = record.get("related_cves", [])
 
-    # If related_cves field exists, take first as main CVE, rest as related
     if isinstance(provided_related_cves, list) and provided_related_cves:
         normalized["cve_id"] = provided_related_cves[0].strip()
         normalized["related_cves"] = [c.strip() for c in provided_related_cves[1:]]
     else:
-        # fallback: parse from title
         all_cves = re.findall(r"CVE-\d{4}-\d{4,}", title, re.IGNORECASE)
         normalized["cve_id"] = all_cves[0] if all_cves else None
         normalized["related_cves"] = all_cves[1:] if len(all_cves) > 1 else []
 
-    # ---------------- Rest of normalization ----------------
+    # ---------------- Dates ----------------
     rd = record.get("release_date")
     if rd:
         try:
@@ -914,11 +1175,9 @@ def read_file(filename, file_type):
 # =========================
 # Build staging source_url
 # =========================
-def build_staging_source_url(note_id, row_num):
-    """Unique key for DB to avoid conflict"""
-    if note_id:
-        return f"{ARCHIVE_BASE_URL}#{note_id}"
-    return f"{ARCHIVE_BASE_URL}#row{row_num}"
+def build_staging_source_url(conn, advisory_url, note_id, cvss_score):
+    base_source_url = f"{advisory_url}#{note_id}#{cvss_score or ''}"
+    return make_unique_source_url(conn, base_source_url)
 
 # =========================
 # Process Data
@@ -940,7 +1199,9 @@ def process_data_file(filename, file_type):
         try:
             raw_json = parse_json_for_jsonb(row["raw_data"])
             note_id = raw_json.get("note_id")
-            staging_url = build_staging_source_url(note_id, row_num)
+            cvss_score = raw_json.get("cvss_score")
+            advisory_url = raw_json.get("advisory_url") or ARCHIVE_BASE_URL
+            staging_url = build_staging_source_url(conn, advisory_url, note_id, cvss_score)
 
             cur.execute(
                 f"""

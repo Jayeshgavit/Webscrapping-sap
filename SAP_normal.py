@@ -27,7 +27,7 @@ TABLE_STAGING = "vendor_staging_table"
 TABLE_VENDORS = "vendors"
 TABLE_ADVISORIES = "advisories"
 TABLE_CVES = "cves"
-TABLE_ADVISORY_CVE_MAP = "advisory_cve_map"
+TABLE_ADVISORY_CVE_MAP = "advisory_cves_map"
 TABLE_ADVISORY_PRODUCT_MAP = "cve_product_map"
 
 # =========================
@@ -51,49 +51,57 @@ def create_normalized_tables(conn):
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {TABLE_VENDORS} (
                 vendor_id SERIAL PRIMARY KEY,
-                vendor_name TEXT UNIQUE
+                vendor_name TEXT NOT NULL UNIQUE
             );
         """)
         # Advisories
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {TABLE_ADVISORIES} (
                 advisory_id TEXT PRIMARY KEY,
-                vendor_id INT REFERENCES {TABLE_VENDORS}(vendor_id) ON DELETE CASCADE,
+                vendor_id INT NOT NULL REFERENCES {TABLE_VENDORS}(vendor_id) ON DELETE CASCADE,
                 title TEXT,
                 severity TEXT,
                 initial_release_date TIMESTAMP,
-                latest_updated_date TIMESTAMP,
+                latest_update_date TIMESTAMP,
                 advisory_url TEXT
             );
         """)
         # CVEs
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {TABLE_CVES} (
-                cve_id TEXT PRIMARY KEY,
+                vendor_id INTEGER NOT NULL REFERENCES {TABLE_VENDORS}(vendor_id) ON DELETE CASCADE,
+                cve_id TEXT NOT NULL,
                 cwe_id TEXT,
                 description TEXT,
-                cvss_score REAL,
+                severity TEXT,
+                cvss_score NUMERIC(3,1),
                 cvss_vector TEXT,
-                initial_release_date TIMESTAMP,
-                latest_updated_date TIMESTAMP,
-                reference_url TEXT
+                initial_release_date DATE,
+                latest_update_date DATE,
+                reference_url TEXT,
+                PRIMARY KEY (vendor_id, cve_id)
             );
         """)
         # Advisory -> CVE mapping
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {TABLE_ADVISORY_CVE_MAP} (
-                advisory_id TEXT REFERENCES {TABLE_ADVISORIES}(advisory_id) ON DELETE CASCADE,
-                cve_id TEXT REFERENCES {TABLE_CVES}(cve_id) ON DELETE CASCADE,
-                PRIMARY KEY (advisory_id, cve_id)
+                advisory_id TEXT NOT NULL REFERENCES {TABLE_ADVISORIES}(advisory_id) ON DELETE CASCADE,
+                vendor_id INTEGER NOT NULL,
+                cve_id TEXT NOT NULL,
+                PRIMARY KEY (advisory_id, vendor_id, cve_id),
+                FOREIGN KEY (vendor_id, cve_id) REFERENCES {TABLE_CVES}(vendor_id, cve_id) ON DELETE CASCADE
             );
         """)
         # Advisory -> Product CPE
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {TABLE_ADVISORY_PRODUCT_MAP} (
                 qs_id SERIAL PRIMARY KEY,
-                advisory_id TEXT REFERENCES {TABLE_ADVISORIES}(advisory_id) ON DELETE CASCADE,
-                affected_products_cpe TEXT,
-                recommendation TEXT
+                vendor_id INTEGER NOT NULL,
+                cve_id TEXT NOT NULL,
+                affected_products_cpe JSONB,
+                recommendations TEXT,
+                FOREIGN KEY (vendor_id, cve_id) REFERENCES {TABLE_CVES}(vendor_id, cve_id) ON DELETE CASCADE,
+                CONSTRAINT cve_product_map_vendor_cve_unique UNIQUE (vendor_id, cve_id)
             );
         """)
         # Add processed flag to staging if missing
@@ -102,7 +110,7 @@ def create_normalized_tables(conn):
             ADD COLUMN IF NOT EXISTS processed BOOLEAN DEFAULT FALSE;
         """)
         conn.commit()
-        print("[DB] Normalized tables created.")
+        print("[DB] Normalized vendor-aware tables created.")
 
 # =========================
 # Helper Functions
@@ -140,12 +148,12 @@ def generate_cpe_entries(product_str: str) -> list:
 
     try:
         versions_str = product_str.split("Version:")[1].strip() if "Version:" in product_str else ""
-        tokens = [t.strip() for t in re.split(r",|–|-", versions_str) if t.strip()] if versions_str else [""]
+        tokens = [t.strip() for t in re.split(r",|–|-", versions_str) if t.strip()] if versions_str else ["*"]
     except Exception:
-        tokens = [""]
+        tokens = ["*"]
 
     for token in tokens:
-        version_clean = token.replace(" ", "_") if token else ""
+        version_clean = token.replace(" ", "_") if token else "*"
         cpe = f"cpe:2.3:a:{vendor}:{product_name}:{version_clean}:*:*:*:*:*:*:*"
         cpes.append(cpe)
 
@@ -171,7 +179,7 @@ def insert_advisory(conn, advisory: dict):
     with conn.cursor() as cur:
         cur.execute(f"""
             INSERT INTO {TABLE_ADVISORIES} (
-                advisory_id, vendor_id, title, severity, initial_release_date, latest_updated_date, advisory_url
+                advisory_id, vendor_id, title, severity, initial_release_date, latest_update_date, advisory_url
             ) VALUES (%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (advisory_id) DO NOTHING
         """, (
@@ -191,13 +199,16 @@ def insert_cve(conn, cve: dict):
     with conn.cursor() as cur:
         cur.execute(f"""
             INSERT INTO {TABLE_CVES} (
-                cve_id, cwe_id, description, cvss_score, cvss_vector, initial_release_date, latest_updated_date, reference_url
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (cve_id) DO NOTHING
+                vendor_id, cve_id, cwe_id, description, severity, cvss_score, cvss_vector,
+                initial_release_date, latest_update_date, reference_url
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (vendor_id, cve_id) DO NOTHING
         """, (
+            cve.get("vendor_id"),
             cve.get("cve_id"),
             cve.get("cwe_id"),
             cve.get("description"),
+            cve.get("severity"),
             cve.get("cvss_score"),
             cve.get("cvss_vector"),
             cve.get("initial_release_date"),
@@ -206,25 +217,26 @@ def insert_cve(conn, cve: dict):
         ))
         conn.commit()
 
-def insert_advisory_cve_map(conn, advisory_id: str, cve_id: str):
-    if not advisory_id or not cve_id:
+def insert_advisory_cve_map(conn, advisory_id: str, vendor_id: int, cve_id: str):
+    if not advisory_id or not vendor_id or not cve_id:
         return
     with conn.cursor() as cur:
         cur.execute(f"""
-            INSERT INTO {TABLE_ADVISORY_CVE_MAP} (advisory_id, cve_id)
-            VALUES (%s,%s)
+            INSERT INTO {TABLE_ADVISORY_CVE_MAP} (advisory_id, vendor_id, cve_id)
+            VALUES (%s,%s,%s)
             ON CONFLICT DO NOTHING
-        """, (advisory_id, cve_id))
+        """, (advisory_id, vendor_id, cve_id))
         conn.commit()
 
-def insert_product_cpe(conn, advisory_id: str, cpe: str):
-    if not advisory_id or not cpe:
+def insert_product_cpe(conn, vendor_id: int, cve_id: str, cpe: str):
+    if not vendor_id or not cve_id or not cpe:
         return
     with conn.cursor() as cur:
         cur.execute(f"""
-            INSERT INTO {TABLE_ADVISORY_PRODUCT_MAP} (advisory_id, affected_products_cpe, recommendation)
-            VALUES (%s,%s,%s)
-        """, (advisory_id, cpe, None))
+            INSERT INTO {TABLE_ADVISORY_PRODUCT_MAP} (vendor_id, cve_id, affected_products_cpe, recommendations)
+            VALUES (%s,%s,%s,%s)
+            ON CONFLICT (vendor_id, cve_id) DO NOTHING
+        """, (vendor_id, cve_id, json.dumps([cpe]), None))
         conn.commit()
 
 # =========================
@@ -239,18 +251,25 @@ def process_staging_row(conn, staging_id, raw_json):
     vendor_id = get_vendor_id(conn, "SAP")
     cleaned_title = clean_title(data.get("title"))
 
-    # Determine advisory IDs
+    # Determine CVEs
     cve_ids = [data.get("cve_id")] + data.get("related_cves", [])
-    advisory_ids = []
 
-    if any(filter(None, cve_ids)):
-        for cve_id in filter(None, cve_ids):
-            advisory_ids.append(f"{data.get('note_id')}-{cve_id}")
-    else:
-        advisory_ids.append(data.get("note_id"))
+    # Insert CVEs and advisory mapping
+    for cve_id in filter(None, cve_ids):
+        insert_cve(conn, {
+            "vendor_id": vendor_id,
+            "cve_id": cve_id,
+            "cwe_id": None,
+            "description": cleaned_title,
+            "severity": data.get("priority"),
+            "cvss_score": data.get("cvss_score"),
+            "cvss_vector": data.get("cvss_vector"),
+            "initial_release_date": data.get("release_date"),
+            "reference_url": data.get("advisory_url")
+        })
 
-    # Insert advisory, CVE, mapping, and products
-    for advisory_id in advisory_ids:
+        # Insert advisory
+        advisory_id = f"{data.get('note_id')}-{cve_id}" if data.get("note_id") else cve_id
         insert_advisory(conn, {
             "advisory_id": advisory_id,
             "vendor_id": vendor_id,
@@ -260,25 +279,15 @@ def process_staging_row(conn, staging_id, raw_json):
             "advisory_url": data.get("advisory_url")
         })
 
-        # Insert CVEs
-        for cve_id in filter(None, cve_ids):
-            insert_cve(conn, {
-                "cve_id": cve_id,
-                "cwe_id": None,
-                "description": cleaned_title,
-                "cvss_score": data.get("cvss_score"),
-                "cvss_vector": data.get("cvss_vector"),
-                "initial_release_date": data.get("release_date"),
-                "reference_url": data.get("advisory_url")
-            })
-            insert_advisory_cve_map(conn, advisory_id, cve_id)
+        # Map advisory to CVE
+        insert_advisory_cve_map(conn, advisory_id, vendor_id, cve_id)
 
         # Insert Product CPEs
         product_pairs = extract_product_versions(data.get("title"))
         for pair in product_pairs:
             cpes = generate_cpe_entries(pair)
             for cpe in cpes:
-                insert_product_cpe(conn, advisory_id, cpe)
+                insert_product_cpe(conn, vendor_id, cve_id, cpe)
 
     # Mark staging row as processed
     with conn.cursor() as cur:
